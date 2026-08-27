@@ -4,6 +4,7 @@ import numpy as np
 import pydeck as pdk
 import os
 from datetime import datetime
+import h3
 
 # Page configuration
 st.set_page_config(
@@ -15,35 +16,48 @@ st.set_page_config(
 # Paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-PREDS_PATH = os.path.join(DATA_DIR, "predictions_with_surge.parquet")
-METRICS_PATH = os.path.join(DATA_DIR, "metrics_report.csv")
 
 @st.cache_data
-def load_predictions():
-    if not os.path.exists(PREDS_PATH):
-        st.error(f"Predictions data not found at {PREDS_PATH}. Please run the pipeline first.")
+def load_predictions(source):
+    preds_path = os.path.join(DATA_DIR, f"predictions_with_surge_{source}.parquet")
+    if not os.path.exists(preds_path):
+        st.error(f"Predictions data not found at {preds_path}. Please run the pipeline for this source first: `python run_pipeline.py --source {source}`")
         return None
-    df = pd.read_parquet(PREDS_PATH)
+    df = pd.read_parquet(preds_path)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     return df
 
 @st.cache_data
-def load_metrics():
-    if os.path.exists(METRICS_PATH):
-        return pd.read_csv(METRICS_PATH)
+def load_metrics(source):
+    metrics_path = os.path.join(DATA_DIR, f"metrics_report_{source}.csv")
+    if os.path.exists(metrics_path):
+        return pd.read_csv(metrics_path)
     return None
 
-df = load_predictions()
-metrics_df = load_metrics()
+# ------------------ SIDEBAR CONTROLS ------------------
+st.sidebar.header("Data Configuration")
+
+# 1. Source Selection
+source_display = st.sidebar.selectbox(
+    "Data Source",
+    options=["NYC TLC Cloud (Real)", "Chicago Synthetic (Mock)"]
+)
+source_map = {
+    "NYC TLC Cloud (Real)": "nyc_cloud",
+    "Chicago Synthetic (Mock)": "synthetic"
+}
+source = source_map[source_display]
+
+df = load_predictions(source)
+metrics_df = load_metrics(source)
 
 if df is not None:
     st.title("🚖 Ride-Hailing Spatio-Temporal Demand & Surge Pricing Dashboard")
-    st.markdown("Use this dashboard to monitor forecasted pickup demand, driver supply, and surge pricing across Uber H3 Hexagons (Resolution 8).")
+    st.markdown(f"Currently viewing predictions and metrics for **{source_display}** mapping pickups on H3 resolution 8.")
     
-    # ------------------ SIDEBAR CONTROLS ------------------
-    st.sidebar.header("Controls & Filters")
+    st.sidebar.header("Time Filters")
     
-    # 1. Select Timestamp
+    # 2. Select Timestamp
     timestamps = sorted(df['timestamp'].unique())
     min_date = timestamps[0].date()
     max_date = timestamps[-1].date()
@@ -59,44 +73,46 @@ if df is not None:
     df_date = df[df['timestamp'].dt.date == selected_date]
     available_hours = sorted(df_date['timestamp'].dt.time.unique())
     
-    selected_time = st.sidebar.select_slider(
-        "Select Time Window (30-min intervals)",
-        options=available_hours,
-        format_func=lambda t: t.strftime("%H:%M")
-    )
+    if available_hours:
+        selected_time = st.sidebar.select_slider(
+            "Select Time Window (30-min intervals)",
+            options=available_hours,
+            format_func=lambda t: t.strftime("%H:%M")
+        )
+        target_dt = datetime.combine(selected_date, selected_time)
+        df_filtered = df_date[df_date['timestamp'].dt.time == selected_time].copy()
+    else:
+        st.warning("No records available for the selected date. Showing first available date.")
+        # Fallback to first timestamp
+        target_dt = timestamps[0]
+        df_filtered = df[df['timestamp'] == target_dt].copy()
     
-    # Target timestamp
-    target_dt = datetime.combine(selected_date, selected_time)
-    df_filtered = df_date[df_date['timestamp'].dt.time == selected_time].copy()
-    
-    # 2. Select Metric to Visualize
+    # 3. Select Metric to Visualize
     metric_choice = st.sidebar.selectbox(
         "Map Visualization Metric",
         options=["Predicted Demand", "Actual Demand (Ground Truth)", "Surge Multiplier", "Driver Supply Proxy"]
     )
     
-    # 3. Model performance reporting
+    # 4. Model performance reporting
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Model Performance (Test Set)")
+    st.sidebar.subheader("Model Performance")
     if metrics_df is not None:
         st.sidebar.table(metrics_df)
     else:
-        st.sidebar.info("Run the training pipeline to generate evaluation metrics.")
+        st.sidebar.info(f"Run the training pipeline (`python run_pipeline.py --source {source}`) to generate evaluation metrics.")
         
     # ------------------ MAP LAYER STYLING ------------------
-    # Add coordinates for visualization
-    # Let's map metrics to columns, colors, and heights
-    max_val = df['target_demand'].max()
+    max_val = df['target_demand'].max() if df['target_demand'].max() > 0 else 1.0
     
     def get_color_and_elevation(row, metric):
         if metric == "Predicted Demand":
             val = row['predicted_demand']
-            ratio = val / max_val if max_val > 0 else 0
+            ratio = val / max_val
             color = [int(255), int(255 * (1 - ratio)), int(0), 160] # Yellow to Red
             elevation = val * 80
         elif metric == "Actual Demand (Ground Truth)":
             val = row['target_demand']
-            ratio = val / max_val if max_val > 0 else 0
+            ratio = val / max_val
             color = [int(0), int(255 * ratio), int(255), 160] # Cyan to Blue
             elevation = val * 80
         elif metric == "Surge Multiplier":
@@ -104,13 +120,12 @@ if df is not None:
             if val <= 1.0:
                 color = [50, 200, 50, 140] # Green (No surge)
             else:
-                # 1.0 to 3.5 range
-                ratio = (val - 1.0) / 2.5
+                ratio = (val - 1.0) / 2.5 # normalized between 0 and 1 (cap 3.5)
                 color = [int(100 + 155 * ratio), int(200 * (1 - ratio)), int(50), 180] # Orange to Purple-Red
             elevation = (val - 1.0) * 800
         else: # Supply
             val = row['supply_lag_1']
-            ratio = val / max_val if max_val > 0 else 0
+            ratio = val / max_val
             color = [int(100 * (1 - ratio)), int(100), int(255), 160] # Indigo gradient
             elevation = val * 80
         return pd.Series([color, elevation], index=['color', 'elevation'])
@@ -131,15 +146,27 @@ if df is not None:
     col3.metric("Average Surge Multiplier", f"{avg_surge:.2f}x")
     col4.metric("Estimated Supply (Prior Dropoffs)", f"{total_supply:.0f}")
     
-    # ------------------ MAP VISUALIZATION ------------------
-    # Chicago Center coordinates
-    view_state = pdk.ViewState(
-        latitude=41.8781,
-        longitude=-87.6298,
-        zoom=10.5,
-        pitch=45,
-        bearing=0
-    )
+    # ------------------ DYNAMIC MAP VISUALIZATION ------------------
+    # Center map on the data coordinates
+    if not df_filtered.empty:
+        sample_hex = df_filtered['h3_index'].iloc[0]
+        lat, lon = h3.cell_to_latlng(sample_hex)
+        view_state = pdk.ViewState(
+            latitude=lat,
+            longitude=lon,
+            zoom=11.5 if source == 'nyc_cloud' else 10.5,
+            pitch=45,
+            bearing=0
+        )
+    else:
+        # Default Chicago
+        view_state = pdk.ViewState(
+            latitude=41.8781,
+            longitude=-87.6298,
+            zoom=10.5,
+            pitch=45,
+            bearing=0
+        )
     
     # Define deck layer
     layer = pdk.Layer(
@@ -177,7 +204,6 @@ if df is not None:
     st.markdown("---")
     st.subheader("💡 Drivers Rebalancing Recommendations (High Deficit Zones)")
     
-    # Find zones where Predicted Demand > Estimated Supply
     df_filtered['deficit'] = df_filtered['predicted_demand'] - df_filtered['supply_lag_1']
     rebalancing_df = df_filtered[df_filtered['deficit'] > 0].sort_values(by='deficit', ascending=False).head(5)
     
@@ -197,9 +223,8 @@ if df is not None:
         
     # ------------------ TIMELINE CHART ------------------
     st.markdown("---")
-    st.subheader("Temporal Demand Profile (Top Hexagon)")
+    st.subheader(f"Temporal Demand Profile (Top Hexagon in {source_display})")
     
-    # Find the top H3 hexagon by total pickups in the dataset
     top_hex = df.groupby('h3_index', observed=False)['target_demand'].sum().idxmax()
     top_hex_df = df[df['h3_index'] == top_hex].sort_values(by='timestamp')
     
